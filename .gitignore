@@ -1,3 +1,6 @@
 r1_*
 run*
-test_r1_*__pycache__/
+test_r1_*
+__pycache__/
+*.pyc
+*.pyo
