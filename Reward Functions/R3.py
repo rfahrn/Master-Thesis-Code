@@ -596,7 +596,8 @@ if __name__ == "__main__":
         if result['matched_ious']:
             ious_str = ', '.join([f'{iou:.3f}' for iou in result['matched_ious'][:5]])
             if len(result['matched_ious']) > 5:
-                ious_str += f', ... ({len(result['matched_ious'])} total)'
+                total_ious = len(result['matched_ious'])
+                ious_str += f', ... ({total_ious} total)'
             print(f"    IoUs:      [{ious_str}]")
     
     # ========================================================================
