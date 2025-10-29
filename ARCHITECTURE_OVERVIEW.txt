@@ -1,0 +1,357 @@
+================================================================================
+                GPRO REWARD FUNCTIONS ARCHITECTURE OVERVIEW
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         GRPO TRAINING PIPELINE                              │
+│                                                                              │
+│  Model Output  →  [Extract Boxes] → Predict Boxes → [Compute Reward]      │
+│  Ground Truth  →  [Extract Boxes] → GT Boxes      ↓                        │
+│                                                     ↓                        │
+│                                                 Reward Signal               │
+│                                                     ↓                        │
+│                                            Policy Gradient Update            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+COMMON UTILITIES (Used by All Functions)
+═════════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────┐         ┌──────────────────────┐
+│ extract_bounding    │         │  compute_iou         │
+│    _boxes()         │         │  (box1, box2)        │
+├─────────────────────┤         ├──────────────────────┤
+│ Input:              │         │ Input: Two boxes     │
+│ - Prediction str    │         │ - Format: [x1,y1,    │
+│ - GT str            │         │           x2,y2]     │
+│                     │         │                      │
+│ Output:             │         │ Output:              │
+│ - List of boxes     │         │ - IoU value [0,1]    │
+│ [x1,y1,x2,y2]      │         │                      │
+│                     │         │ Formula:             │
+│ Features:           │         │ IoU = Inter/Union    │
+│ - Regex pattern     │         │                      │
+│ - Sci notation      │         │ Time: O(1)           │
+│ - Validation        │         │                      │
+└─────────────────────┘         └──────────────────────┘
+
+
+REWARD FUNCTION HIERARCHY (By Complexity)
+═════════════════════════════════════════════════════════════════════════════
+
+Level 1: SIMPLEST
+    ┌──────────────────────┐
+    │    R1: AP@0.5        │
+    ├──────────────────────┤
+    │ Formula:             │
+    │ reward = AP@0.5      │
+    │                      │
+    │ Hyperparams: 1       │
+    │ NO_BOX_BONUS = 0.2   │
+    │                      │
+    │ Matching: Greedy     │
+    │ Time: O(n² log n)    │
+    │                      │
+    │ Use: Baseline,       │
+    │ Evaluation matching  │
+    └──────────────────────┘
+
+
+Level 2: SIMPLE
+    ┌──────────────────────┐         ┌──────────────────────┐
+    │    R2: F-β × IoU     │         │    R3: F-β × IoU     │
+    │   (RL-Optimized)     │         │   (Production)       │
+    ├──────────────────────┤         ├──────────────────────┤
+    │ Formula:             │         │ Formula:             │
+    │ reward = F_β ×       │         │ reward = F_β ×       │
+    │ mean_IoU             │         │ mean_IoU             │
+    │                      │         │                      │
+    │ Hyperparams: 3       │         │ Hyperparams: 3       │
+    │ BETA = 1.0           │         │ BETA = 1.0           │
+    │ MIN_IOU = 0.5        │         │ MIN_IOU = 0.5        │
+    │ NO_BOX_BONUS = 0.2   │         │ NO_BOX_BONUS = 0.2   │
+    │                      │         │                      │
+    │ Matching: Greedy     │         │ Matching: Greedy     │
+    │ Time: O(n² log n)    │         │ Time: O(n² log n)    │
+    │                      │         │                      │
+    │ Stability: High      │         │ Stability: Highest   │
+    │ Use: General GRPO    │         │ Use: Default choice  │
+    └──────────────────────┘         └──────────────────────┘
+
+
+Level 3: MEDIUM
+    ┌──────────────────────────────────┐
+    │   R4: Smooth Gradients           │
+    ├──────────────────────────────────┤
+    │ Formula:                         │
+    │ reward = F_β × smooth_quality    │
+    │                                  │
+    │ where smooth_quality =           │
+    │ mean(spline(IoU_i))              │
+    │                                  │
+    │ Hyperparams: 4-5                 │
+    │ BETA = 1.5                       │
+    │ MIN_IOU = 0.5                    │
+    │ NO_BOX_BONUS = 0.2               │
+    │ USE_CENTER_AWARE = False         │
+    │ CENTER_WEIGHT = 0.15 (optional)  │
+    │                                  │
+    │ Spline: Cubic Hermite            │
+    │ Control Points:                  │
+    │ (0,0,1.5), (0.5,0.5,1.1),        │
+    │ (0.8,0.8,0.9), (1,1,0.5)         │
+    │                                  │
+    │ Matching: Greedy                 │
+    │ Time: O(n² log n)                │
+    │                                  │
+    │ Stability: Good                  │
+    │ Use: Medical, advanced GRPO      │
+    └──────────────────────────────────┘
+
+
+Level 4: MOST COMPLEX
+    ┌──────────────────────────────────┐
+    │   R5: Strict Medical Focus       │
+    ├──────────────────────────────────┤
+    │ Formula:                         │
+    │ reward = F_β + penalties + bonus │
+    │                                  │
+    │ Hyperparams: 5                   │
+    │ BETA = 1.0 (0.5 for precision)   │
+    │ IOU_THRESHOLD = 0.5              │
+    │ PENALTY_STRENGTH = 0.7           │
+    │ NO_FINDINGS_REWARD = 0.3         │
+    │ RECALL_BONUS = 0.1               │
+    │                                  │
+    │ Quality: Piecewise linear        │
+    │ 3 regions: <0.15, 0.15-0.5, >0.5│
+    │                                  │
+    │ Penalties:                       │
+    │ penalty(k) = exp(-α × k)         │
+    │                                  │
+    │ Matching: Hungarian (optimal)    │
+    │ Time: O(n³)                      │
+    │                                  │
+    │ Stability: Medium                │
+    │ Use: Exploration, complex cases  │
+    └──────────────────────────────────┘
+
+
+MATCHING STRATEGIES COMPARISON
+═════════════════════════════════════════════════════════════════════════════
+
+GREEDY MATCHING (R1, R2, R3, R4)
+┌─────────────────────────────────────┐
+│ Algorithm:                          │
+│ 1. Build IoU matrix (n × m)         │
+│ 2. Sort pred by max IoU (desc)      │
+│ 3. Greedy match to best unmatched   │
+│ 4. Only accept if IoU >= threshold  │
+│                                     │
+│ Time: O(n² log n)                   │
+│ Space: O(n²)                        │
+│ Optimality: Usually optimal         │
+│ Stability: Better for RL            │
+│ Example: R3                         │
+└─────────────────────────────────────┘
+
+
+HUNGARIAN MATCHING (R5)
+┌──────────────────────────────────────┐
+│ Algorithm:                           │
+│ 1. Build IoU matrix (n × m)          │
+│ 2. Convert to cost: 1 - IoU          │
+│ 3. Pad to square if needed           │
+│ 4. linear_sum_assignment()           │
+│ 5. Extract optimal matches           │
+│                                      │
+│ Time: O(n³)                          │
+│ Space: O(n²)                         │
+│ Optimality: Guaranteed optimal       │
+│ Stability: Slower convergence        │
+│ Example: R5                          │
+└──────────────────────────────────────┘
+
+
+MATHEMATICAL CORE FORMULAS
+═════════════════════════════════════════════════════════════════════════════
+
+IoU (All Functions)
+───────────────────
+    intersection_area = (min(x2_a, x2_b) - max(x1_a, x1_b)) ×
+                        (min(y2_a, y2_b) - max(y1_a, y1_b))
+    
+    union_area = area_a + area_b - intersection_area
+    
+    IoU = intersection_area / union_area
+
+
+F-beta Score (R2, R3, R4, R5)
+──────────────────────────────
+         (1 + β²) × P × R
+    F_β = ──────────────────
+          β² × P + R
+    
+    where P = precision = TP / (TP + FP)
+          R = recall = TP / (TP + FN)
+          β = parameter
+
+
+Average Precision (R1)
+──────────────────────
+    AP = Σ(Recall[i+1] - Recall[i]) × Precision[i+1]
+    
+    with binary IoU threshold at 0.5
+
+
+Smooth Quality (R4)
+───────────────────
+    smooth_quality = mean(spline(IoU_i))
+    
+    where spline is cubic Hermite with:
+    - x: [0.0, 0.5, 0.8, 1.0]
+    - y: [0.0, 0.5, 0.8, 1.0]
+    - dy/dx: [1.5, 1.1, 0.9, 0.5]
+
+
+Piecewise Quality (R5)
+──────────────────────
+    quality(IoU) = {
+        0                       if IoU < 0.15
+        0.5×(IoU-0.15)/(τ-0.15) if 0.15 ≤ IoU < τ
+        0.5 + 0.5×(IoU-τ)/(1-τ)  if IoU ≥ τ
+    }
+    
+    penalty(k) = exp(-α × k)
+
+
+PERFORMANCE COMPARISON
+═════════════════════════════════════════════════════════════════════════════
+
+Metric              │ R1    │ R2    │ R3   │ R4    │ R5
+────────────────────┼───────┼───────┼──────┼───────┼────────
+Mean Reward         │ -     │ 0.487 │0.487 │ 0.490 │ 0.494 ⭐
+Std Dev (Stability) │ -     │ 0.369 │0.369 │ 0.371 │ 0.371
+Complex Multi-Box   │ -     │ 0.565 │0.565 │ 0.546 │ 0.669 ⭐
+False Negative      │ -     │ 0.333 │0.333 │ 0.265 │ 0.333
+  (Strictness)      │ -     │       │      │⭐Best │
+Time Complexity     │O(n²logn)│O(n²logn)│O(n²logn)│O(n²logn)│O(n³)
+────────────────────┴───────┴───────┴──────┴───────┴────────
+
+
+INTEGRATION INTERFACE (All Functions)
+═════════════════════════════════════════════════════════════════════════════
+
+FUNCTION SIGNATURE:
+    def compute_score(
+        data_source: str,          # Dataset name
+        solution_str: str,         # Model output with <answer>...</answer>
+        ground_truth: str,         # GT boxes "[x1,y1,x2,y2],..."
+        extra_info=None,           # Optional metadata
+        return_details: bool=False # Detailed metrics?
+    ) -> float | Dict[str, Any]
+
+INPUT FORMATS:
+    Model Output:  "<answer>[0.1, 0.2, 0.3, 0.4]</answer>"
+    Ground Truth:  "[0.1, 0.2, 0.3, 0.4]" or ""
+    
+OUTPUT (Simple):
+    float reward ∈ [0, 1]
+    
+OUTPUT (Detailed):
+    {
+        'reward': float,
+        'precision': float,
+        'recall': float,
+        'mean_iou': float,
+        'fbeta_score': float,
+        'matches': [(pred_idx, gt_idx, iou), ...],
+        'edge_case': str,
+        'iou_matrix': numpy.ndarray,
+        ...
+    }
+
+
+DECISION TREE: WHICH FUNCTION TO USE?
+═════════════════════════════════════════════════════════════════════════════
+
+START
+  │
+  ├─ "Do I need COCO metric matching?"
+  │   └─ YES → Use R1
+  │
+  ├─ "Is this a medical application?"
+  │   ├─ YES → "Need strict on false negatives?"
+  │   │   ├─ YES → Use R4 ⭐ RECOMMENDED
+  │   │   └─ NO  → Use R5
+  │   │
+  │   └─ NO → "Want simple baseline?"
+  │       ├─ YES → Use R3
+  │       └─ NO → "Need advanced gradients?"
+  │           ├─ YES → Use R4
+  │           └─ NO → Use R2
+  │
+  ├─ "In early exploration phase?"
+  │   └─ YES → Use R5 (partial credit helps)
+  │
+  ├─ "Need maximum stability?"
+  │   └─ YES → Use R3
+  │
+  └─ "Need best multi-box performance?"
+      └─ YES → Use R5
+
+
+CURRICULUM LEARNING STRATEGY
+═════════════════════════════════════════════════════════════════════════════
+
+       Phase 1              Phase 2              Phase 3
+    Warm-up (0-20%)      Refinement (20-70%)   Fine-tuning (70-100%)
+    
+    ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+    │     R5       │     │     R4       │     │   R3 or R6   │
+    ├──────────────┤     ├──────────────┤     ├──────────────┤
+    │ MIN_IOU=0.2  │────→│ MIN_IOU=0.5  │────→│ MIN_IOU=0.5  │
+    │              │     │              │     │              │
+    │ Goal: Learn  │     │ Goal:        │     │ Goal:        │
+    │ basic detect │     │ Improve      │     │ Optimize     │
+    │              │     │ precision    │     │ final metric │
+    │ Reward: High │     │              │     │              │
+    │ Partial OK   │     │ Stable       │     │ Most stable  │
+    └──────────────┘     └──────────────┘     └──────────────┘
+
+
+FILES AND LOCATION STRUCTURE
+═════════════════════════════════════════════════════════════════════════════
+
+Reward_Functions/
+├── R1.py                    [Simple AP@0.5 Baseline]
+├── R2.py                    [F-β × IoU]
+├── R3.py                    [F-β × mean_IoU - Production]
+├── R4.py                    [Enhanced Smooth Gradients] ⭐ RECOMMENDED
+├── R5.py                    [Strict Medical Focus / Hungarian]
+└── README.md                [Comprehensive guide]
+
+Root Directory:
+├── evaluate_reward_functions.py  [Evaluation framework]
+├── test_r1_simple.py             [Simple test]
+├── REWARD_FUNCTIONS_DETAILED_SUMMARY.md  [Full reference]
+├── QUICK_REFERENCE_GUIDE.md      [Quick lookup]
+├── REWARD_FUNCTION_ANALYSIS.md   [Evaluation results]
+└── ARCHITECTURE_OVERVIEW.txt     [This file]
+
+
+KEY TAKEAWAYS
+═════════════════════════════════════════════════════════════════════════════
+
+1. All functions share common interface: compute_score()
+2. All use same box extraction and IoU calculation
+3. Greedy matching (R1-R4): Fast, good for RL
+4. Hungarian matching (R5): Optimal, better for medical
+5. R3 is safest default choice
+6. R4 is recommended for medical imaging
+7. R5 best for exploration/complex scenarios
+8. Curriculum learning (R5→R4→R3) gives best results
+
+═════════════════════════════════════════════════════════════════════════════
+Generated: October 2025 | GPRO Reward Functions Architecture
+═════════════════════════════════════════════════════════════════════════════
