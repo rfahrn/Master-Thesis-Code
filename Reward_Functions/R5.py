@@ -1,43 +1,108 @@
 """
-best_reward_soft.py - Smooth Reward with Partial Credit
-========================================================
-Gives partial credit for mediocre boxes (IoU 0.2-0.5).
-Still simple, but not harsh!
+R7 Simplified: Strict Medical Grounding with Minimal Hyperparameters
 
-KEY CHANGE:
-- Lower matching threshold to 0.2 (accept mediocre attempts)
-- But weight contribution by IoU² (so mediocre gets less credit)
-- This gives smooth learning signal!
+Simplified to just 5 core parameters for clear thesis explanation:
+1. BETA - F-beta parameter (0.5 = precision focus, 2.0 = recall focus)
+2. IOU_THRESHOLD - Minimum IoU for reward (strict = 0.5)
+3. PENALTY_STRENGTH - How harsh to penalize errors (0-1)
+4. NO_FINDINGS_REWARD - Score for correct negatives
+5. RECALL_BONUS - Optional bonus for finding all boxes
+
+Mathematical formulation remains powerful but simpler to explain.
 """
 
 import re
+from typing import List, Tuple, Optional, Dict
 import numpy as np
-from typing import List, Tuple, Dict, Any
+from scipy.optimize import linear_sum_assignment
 
-# ============================================================================
-# HYPERPARAMETERS (still only 3!)
-# ============================================================================
 
-MIN_IOU_THRESHOLD = 0.2  # Accept mediocre attempts (lowered from 0.5!)
-NO_BOX_BONUS = 0.2
-BETA = 1.0
+# ==================== SIMPLIFIED CONFIGURATION ====================
+# Only 5 core hyperparameters for thesis clarity
 
-# ============================================================================
-# CORE FUNCTIONS
-# ============================================================================
+# Core detection parameters
+BETA = 1                    # F-beta: 0.5=precision focus, 1.0=balanced, 2.0=recall focus
+IOU_THRESHOLD = 0.5           # Minimum IoU for "good" detection (strict for medical)
+PENALTY_STRENGTH = 0.7        # Penalty harshness (0=gentle, 1=harsh)
 
-def extract_bounding_boxes(answer: str) -> List[List[float]]:
-    """Extract [x1, y1, x2, y2] from answer string."""
+# Reward structure
+NO_FINDINGS_REWARD = 0.3      # Reward for correct no-findings (low to prevent exploitation)
+RECALL_BONUS = 0.1            # Bonus for finding ALL boxes (set 0 to disable)
+
+# Fixed internal parameters (not exposed as hyperparameters)
+MIN_BOX_SIZE = 0.001          # Minimum normalized box size
+MIN_IOU_FOR_REWARD = 0.15     # Below this IoU = zero reward (fixed)
+
+
+# ==================== SIMPLIFIED REWARD FUNCTIONS ====================
+
+def simple_iou_reward(iou: float, threshold: float = 0.5) -> float:
+    """
+    Simplified IoU reward with three clear regions.
+    
+    Mathematical formula:
+    - IoU < 0.15: reward = 0 (too poor)
+    - 0.15 ≤ IoU < threshold: reward = 0.5 × (IoU - 0.15) / (threshold - 0.15)
+    - IoU ≥ threshold: reward = 0.5 + 0.5 × (IoU - threshold) / (1 - threshold)
+    
+    This creates a piecewise linear function with clear interpretation.
+    """
+    if iou < MIN_IOU_FOR_REWARD:
+        return 0.0
+    elif iou < threshold:
+        # Linear ramp to 0.5 at threshold
+        range_size = threshold - MIN_IOU_FOR_REWARD
+        return 0.5 * (iou - MIN_IOU_FOR_REWARD) / range_size
+    else:
+        # Linear from 0.5 to 1.0
+        range_size = 1.0 - threshold
+        return 0.5 + 0.5 * (iou - threshold) / range_size
+
+
+def compute_penalty(num_errors: int, strength: float = 0.7) -> float:
+    """
+    Unified penalty function for false positives and overprediction.
+    
+    Formula: penalty = exp(-strength × num_errors)
+    
+    Examples with strength=0.7:
+    - 1 error: 0.50
+    - 2 errors: 0.25
+    - 3 errors: 0.12
+    """
+    return np.exp(-strength * num_errors)
+
+
+# ==================== CORE FUNCTIONS ====================
+
+def extract_boxes(text: str) -> List[List[float]]:
+    """Extract normalized [0,1] bounding boxes from text."""
     NUM = r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
     pattern = rf"\[\s*({NUM})\s*,\s*({NUM})\s*,\s*({NUM})\s*,\s*({NUM})\s*\]"
+    
     boxes = []
-    for m in re.finditer(pattern, answer):
+    for match in re.finditer(pattern, text):
         try:
-            b = [float(m.group(i)) for i in range(1, 5)]
-            if all(np.isfinite(b)):
-                boxes.append(b)
-        except:
+            coords = [float(match.group(i)) for i in range(1, 5)]
+            
+            # Validate normalized coordinates
+            if not all(np.isfinite(coords)):
+                continue
+            if not all(-0.01 <= c <= 1.01 for c in coords):
+                continue
+                
+            # Clip and order
+            x1, y1, x2, y2 = [np.clip(c, 0.0, 1.0) for c in coords]
+            x1, x2 = min(x1, x2), max(x1, x2)
+            y1, y2 = min(y1, y2), max(y1, y2)
+            
+            # Check minimum size
+            if (x2 - x1) >= MIN_BOX_SIZE and (y2 - y1) >= MIN_BOX_SIZE:
+                boxes.append([x1, y1, x2, y2])
+                
+        except (ValueError, IndexError):
             continue
+            
     return boxes
 
 
@@ -48,7 +113,10 @@ def compute_iou(box1: List[float], box2: List[float]) -> float:
     x2 = min(box1[2], box2[2])
     y2 = min(box1[3], box2[3])
     
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+        
+    inter = (x2 - x1) * (y2 - y1)
     area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
     area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
     union = area1 + area2 - inter
@@ -56,294 +124,284 @@ def compute_iou(box1: List[float], box2: List[float]) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def iou_to_quality(iou: float) -> float:
+def hungarian_matching(pred_boxes: List[List[float]], 
+                       gt_boxes: List[List[float]]) -> Tuple[List[float], int]:
     """
-    Convert IoU to quality score with smooth partial credit.
-    
-    DESIGN:
-    - IoU < 0.2: quality = 0 (too poor, no credit)
-    - IoU 0.2-0.5: quality grows quadratically (partial credit!)
-    - IoU 0.5-1.0: quality grows linearly (full credit)
-    
-    WHY QUADRATIC [0.2, 0.5]:
-    - Gives partial credit (not zero!)
-    - But penalizes mediocre more than good
-    - Encourages crossing 0.5 threshold
-    
-    EXAMPLES:
-    - IoU=0.0 → quality=0.00 (no overlap)
-    - IoU=0.2 → quality=0.00 (minimum threshold)
-    - IoU=0.3 → quality=0.11 (partial credit!)
-    - IoU=0.4 → quality=0.33 (decent partial credit)
-    - IoU=0.5 → quality=0.50 (threshold crossed)
-    - IoU=0.7 → quality=0.70 (good)
-    - IoU=1.0 → quality=1.00 (perfect)
-    """
-    if iou < 0.2:
-        return 0.0
-    elif iou < 0.5:
-        # Quadratic growth [0.2, 0.5] → [0, 0.5]
-        normalized = (iou - 0.2) / (0.5 - 0.2)  # [0, 1]
-        return 0.5 * (normalized ** 2)  # [0, 0.5], quadratic
-    else:
-        # Linear growth [0.5, 1.0] → [0.5, 1.0]
-        return iou
-
-
-def greedy_match_soft(pred_boxes: List[List[float]], 
-                      gt_boxes: List[List[float]],
-                      threshold: float = MIN_IOU_THRESHOLD) -> Tuple[int, List[float], List[float]]:
-    """
-    Greedy matching with soft quality scores.
-    
-    Returns: 
-        num_matches: Number of boxes matched
-        raw_ious: Raw IoU values for matches
-        quality_scores: Quality scores (with partial credit) for matches
+    Perform Hungarian matching and return IoU values and match count.
+    Simplified to return just what we need.
     """
     if not pred_boxes or not gt_boxes:
-        return 0, [], []
+        return [], 0
+        
+    M, N = len(pred_boxes), len(gt_boxes)
     
-    n_pred, n_gt = len(pred_boxes), len(gt_boxes)
-    
-    # Compute IoU matrix
-    ious = np.zeros((n_pred, n_gt))
+    # Build IoU matrix
+    iou_matrix = np.zeros((M, N))
     for i, pred in enumerate(pred_boxes):
         for j, gt in enumerate(gt_boxes):
-            ious[i, j] = compute_iou(pred, gt)
+            iou_matrix[i, j] = compute_iou(pred, gt)
     
-    # Greedy matching
-    matched_gt = set()
-    raw_ious = []
-    quality_scores = []
+    # Hungarian algorithm
+    cost_matrix = 1.0 - iou_matrix
     
-    # Sort predictions by max IoU (descending)
-    max_ious = ious.max(axis=1) if n_gt > 0 else np.zeros(n_pred)
-    for idx in np.argsort(-max_ious):
-        available = [j for j in range(n_gt) if j not in matched_gt]
-        if not available:
-            break
+    if M != N:
+        max_dim = max(M, N)
+        padded_cost = np.ones((max_dim, max_dim))
+        padded_cost[:M, :N] = cost_matrix
+        row_ind, col_ind = linear_sum_assignment(padded_cost)
         
-        best_j = max(available, key=lambda j: ious[idx, j])
-        best_iou = ious[idx, best_j]
+        iou_values = []
+        for r, c in zip(row_ind, col_ind):
+            if r < M and c < N:
+                iou_values.append(float(iou_matrix[r, c]))
+    else:
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        iou_values = [float(iou_matrix[r, c]) for r, c in zip(row_ind, col_ind)]
         
-        # Lower threshold! Accept mediocre attempts!
-        if best_iou >= threshold:
-            matched_gt.add(best_j)
-            raw_ious.append(best_iou)
-            quality_scores.append(iou_to_quality(best_iou))
-    
-    return len(raw_ious), raw_ious, quality_scores
+    return iou_values, len(iou_values)
 
 
-def compute_reward_soft(pred_boxes: List[List[float]], 
-                        gt_boxes: List[List[float]],
-                        beta: float = BETA,
-                        return_details: bool = False) -> float | Dict[str, Any]:
+# ==================== MAIN SIMPLIFIED REWARD ====================
+
+def compute_r7_simplified(pred_boxes: List[List[float]],
+                         gt_boxes: List[List[float]],
+                         beta: float = BETA,
+                         iou_threshold: float = IOU_THRESHOLD,
+                         penalty_strength: float = PENALTY_STRENGTH) -> Dict:
     """
-    Soft reward with partial credit for mediocre boxes.
+    Simplified R7 reward computation with minimal parameters.
     
-    FORMULA:
-    1. Match boxes (threshold=0.2, accepting mediocre attempts)
-    2. Compute quality scores (quadratic [0.2,0.5], linear [0.5,1.0])
-    3. Weighted F-beta using quality scores
-    4. Final reward = F-beta
+    Core formula:
+    1. Match boxes using Hungarian algorithm
+    2. Compute F-beta score with IoU-weighted TP
+    3. Apply penalties for false positives or overprediction
+    4. Add recall bonus if all boxes found
     
-    WHY THIS IS BETTER:
-    ✅ Partial credit for IoU=0.3-0.5 (not zero!)
-    ✅ Smooth gradient (no cliff at 0.5)
-    ✅ Still encourages good boxes (quadratic penalty for mediocre)
-    ✅ Bounded [0, 1]
-    ✅ Simple (3 hyperparameters)
-    
-    EXAMPLES:
-    - IoU=0.45 → quality=0.39 → contributes to reward! (not 0)
-    - IoU=0.35 → quality=0.19 → some credit (encourages improvement)
-    - IoU=0.15 → quality=0.00 → no credit (too poor)
+    Args:
+        pred_boxes: Predicted boxes
+        gt_boxes: Ground truth boxes  
+        beta: F-beta parameter (0.5=precision, 2.0=recall)
+        iou_threshold: Minimum IoU for good detection
+        penalty_strength: How harsh penalties are
+        
+    Returns:
+        Dictionary with score and components
     """
-    n_pred = len(pred_boxes)
-    n_gt = len(gt_boxes)
+    M = len(pred_boxes)  # Number predicted
+    N = len(gt_boxes)    # Number ground truth
     
-    details = {
-        'reward': 0.0,
-        'fbeta': 0.0,
+    # Initialize result
+    result = {
+        'score': 0.0,
+        'num_pred': M,
+        'num_gt': N,
         'precision': 0.0,
         'recall': 0.0,
-        'num_matches': 0,
-        'raw_ious': [],
-        'quality_scores': [],
-        'mean_quality': 0.0
+        'avg_iou': 0.0,
+        'case': 'unknown'
     }
     
-    # Edge cases
-    if n_pred == 0 and n_gt == 0:
-        details['reward'] = NO_BOX_BONUS
-        details['fbeta'] = 1.0
-        details['precision'] = 1.0
-        details['recall'] = 1.0
-        details['mean_quality'] = 1.0
-        return details if return_details else NO_BOX_BONUS
+    # === CASE 1: No ground truth (no findings expected) ===
+    if N == 0:
+        if M == 0:
+            # Correct no-findings
+            result['score'] = NO_FINDINGS_REWARD
+            result['case'] = 'correct_negative'
+        else:
+            # False positives - apply penalty
+            penalty = compute_penalty(M, penalty_strength)
+            result['score'] = NO_FINDINGS_REWARD * penalty * 0.5  # Extra harsh for FP
+            result['case'] = f'false_positive_{M}'
+        return result
     
-    if n_pred == 0 or n_gt == 0:
-        details['reward'] = 0.0
-        return details if return_details else 0.0
+    # === CASE 2: Missed all findings ===
+    if M == 0:
+        result['score'] = 0.0
+        result['case'] = 'missed_all'
+        return result
     
-    # Soft matching with quality scores
-    num_matches, raw_ious, quality_scores = greedy_match_soft(pred_boxes, gt_boxes)
+    # === CASE 3: Normal detection - compute F-beta ===
     
-    details['num_matches'] = num_matches
-    details['raw_ious'] = raw_ious
-    details['quality_scores'] = quality_scores
+    # Get IoU values from optimal matching
+    iou_values, num_matches = hungarian_matching(pred_boxes, gt_boxes)
     
-    if num_matches == 0:
-        details['reward'] = 0.0
-        return details if return_details else 0.0
+    # Compute weighted true positives
+    tp_weighted = sum(simple_iou_reward(iou, iou_threshold) for iou in iou_values)
     
-    # Weighted F-beta using quality scores
-    # Precision: sum of quality scores / num predictions
-    # Recall: sum of quality scores / num GTs
-    weighted_tp = sum(quality_scores)
+    # Compute precision and recall
+    precision = tp_weighted / M if M > 0 else 0.0
+    recall = tp_weighted / N if N > 0 else 0.0
     
-    precision = weighted_tp / n_pred
-    recall = weighted_tp / n_gt
-    
-    details['precision'] = precision
-    details['recall'] = recall
-    details['mean_quality'] = np.mean(quality_scores)
-    
-    # F-beta
-    if precision + recall == 0:
-        fbeta = 0.0
-    else:
+    # F-beta score
+    if precision + recall > 0:
         beta_sq = beta * beta
-        fbeta = (1 + beta_sq) * precision * recall / (beta_sq * precision + recall)
+        f_beta = (1 + beta_sq) * precision * recall / (beta_sq * precision + recall)
+    else:
+        f_beta = 0.0
     
-    details['fbeta'] = fbeta
-    details['reward'] = fbeta
+    # Apply overprediction penalty if too many boxes
+    if M > N * 1.5:  # More than 50% extra boxes
+        excess = M - N
+        penalty = compute_penalty(excess, penalty_strength * 0.5)  # Gentler than FP
+        f_beta *= penalty
     
-    return details if return_details else fbeta
+    # Apply recall bonus if all boxes found with good IoU
+    if RECALL_BONUS > 0 and N >= 2 and num_matches == N:
+        if all(iou >= iou_threshold for iou in iou_values[:N]):
+            f_beta = min(1.0, f_beta + RECALL_BONUS)
+            result['recall_bonus'] = True
+    
+    # Store results
+    result['score'] = float(np.clip(f_beta, 0.0, 1.0))
+    result['precision'] = float(precision)
+    result['recall'] = float(recall)
+    result['avg_iou'] = float(np.mean(iou_values)) if iou_values else 0.0
+    result['case'] = 'detection'
+    
+    return result
 
 
-def compute_score(data_source: str, solution_str: str, 
-                 ground_truth: str, extra_info=None,
-                 return_details: bool = False) -> float | Dict[str, Any]:
-    """GRPO interface with soft partial credit."""
+# ==================== VERL INTERFACE ====================
+
+def compute_score(data_source: str, solution_str: str, ground_truth: str,
+                 extra_info: Optional[Dict] = None) -> float:
+    """
+    VeRL interface - simplified with optional parameter override.
+    
+    Extra info can contain:
+    - beta: Override F-beta parameter
+    - iou_threshold: Override IoU threshold
+    - penalty_strength: Override penalty strength
+    """
     # Extract boxes
-    m = re.search(r"<answer>(.*?)</answer>", solution_str, flags=re.I | re.S)
-    answer = m.group(1) if m else solution_str
+    pred_boxes = extract_boxes(solution_str)
+    gt_boxes = extract_boxes(ground_truth)
     
-    pred_boxes = extract_bounding_boxes(answer)
-    gt_boxes = extract_bounding_boxes(ground_truth)
+    # Get parameters (use defaults or override from extra_info)
+    beta = BETA
+    iou_threshold = IOU_THRESHOLD
+    penalty_strength = PENALTY_STRENGTH
     
-    return compute_reward_soft(pred_boxes, gt_boxes, BETA, return_details)
+    if extra_info:
+        beta = extra_info.get('beta', beta)
+        iou_threshold = extra_info.get('iou_threshold', iou_threshold)
+        penalty_strength = extra_info.get('penalty_strength', penalty_strength)
+    
+    # Compute score
+    result = compute_r7_simplified(
+        pred_boxes, gt_boxes, 
+        beta, iou_threshold, penalty_strength
+    )
+    
+    return result['score']
+
+
+# ==================== ANALYSIS & TESTING ====================
+
+def analyze_reward(solution_str: str, ground_truth: str,
+                  beta: float = BETA,
+                  iou_threshold: float = IOU_THRESHOLD) -> Dict:
+    """Detailed analysis for debugging."""
+    pred_boxes = extract_boxes(solution_str)
+    gt_boxes = extract_boxes(ground_truth)
+    
+    return compute_r7_simplified(
+        pred_boxes, gt_boxes,
+        beta, iou_threshold, PENALTY_STRENGTH
+    )
 
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("SOFT REWARD WITH PARTIAL CREDIT")
+    print("R7 SIMPLIFIED - MINIMAL HYPERPARAMETERS FOR THESIS")
     print("=" * 80)
-    
-    # Show quality function
-    print("\nQuality Function (IoU → Quality Score):")
-    print(f"{'IoU':<8} {'Quality':<10} {'Interpretation'}")
-    print("-" * 50)
-    
-    test_ious = [0.0, 0.1, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-    for iou in test_ious:
-        quality = iou_to_quality(iou)
-        if iou < 0.2:
-            interp = "No credit"
-        elif iou < 0.5:
-            interp = "Partial credit (quadratic)"
-        else:
-            interp = "Full credit (linear)"
-        print(f"{iou:<8.2f} {quality:<10.3f} {interp}")
+    print(f"\nOnly 5 Core Parameters:")
+    print(f"  1. BETA = {BETA} (F-beta: precision vs recall)")
+    print(f"  2. IOU_THRESHOLD = {IOU_THRESHOLD} (minimum for good detection)")
+    print(f"  3. PENALTY_STRENGTH = {PENALTY_STRENGTH} (error harshness)")
+    print(f"  4. NO_FINDINGS_REWARD = {NO_FINDINGS_REWARD} (correct negative score)")
+    print(f"  5. RECALL_BONUS = {RECALL_BONUS} (complete detection bonus)")
     
     # Test cases
-    print("\n" + "=" * 80)
-    print("TEST CASES")
-    print("=" * 80)
-    
     test_cases = [
-        ("Perfect", [[0.1, 0.1, 0.2, 0.2]], [[0.1, 0.1, 0.2, 0.2]]),
-        ("Good IoU (0.7)", [[0.1, 0.12, 0.2, 0.22]], [[0.1, 0.1, 0.2, 0.2]]),
-        ("Mediocre IoU (0.45) - NOW GETS CREDIT!", [[0.1, 0.15, 0.2, 0.25]], [[0.1, 0.1, 0.2, 0.2]]),
-        ("Poor IoU (0.35) - SOME CREDIT!", [[0.1, 0.15, 0.2, 0.3]], [[0.1, 0.1, 0.2, 0.2]]),
-        ("Very poor IoU (0.15) - No credit", [[0.1, 0.3, 0.2, 0.4]], [[0.1, 0.1, 0.2, 0.2]]),
-        ("True negative", [], []),
-        ("Hallucination", [[0.1, 0.1, 0.2, 0.2]], []),
-        ("Missed", [], [[0.1, 0.1, 0.2, 0.2]]),
-        ("Over-prediction", [[0.1, 0.1, 0.2, 0.2], [0.3, 0.3, 0.4, 0.4]], 
-         [[0.1, 0.1, 0.2, 0.2]]),
+        ("Perfect", "[0.3, 0.4, 0.5, 0.6]", "[0.3, 0.4, 0.5, 0.6]"),
+        ("Good (70% IoU)", "[0.30, 0.40, 0.48, 0.58]", "[0.30, 0.40, 0.50, 0.60]"),
+        ("Threshold (50% IoU)", "[0.30, 0.40, 0.45, 0.55]", "[0.30, 0.40, 0.50, 0.60]"),
+        ("Poor (30% IoU)", "[0.25, 0.35, 0.40, 0.50]", "[0.30, 0.40, 0.50, 0.60]"),
+        ("Very Poor (10% IoU)", "[0.1, 0.1, 0.2, 0.2]", "[0.3, 0.4, 0.5, 0.6]"),
+        ("Correct negative", "", ""),
+        ("1 False positive", "[0.1, 0.1, 0.2, 0.2]", ""),
+        ("2 False positives", "[0.1, 0.1, 0.2, 0.2], [0.3, 0.3, 0.4, 0.4]", ""),
+        ("Missed all", "", "[0.3, 0.4, 0.5, 0.6]"),
+        ("2 perfect (bonus)", "[0.1, 0.1, 0.2, 0.2], [0.3, 0.3, 0.4, 0.4]", 
+         "[0.1, 0.1, 0.2, 0.2], [0.3, 0.3, 0.4, 0.4]"),
+        ("Overprediction", "[0.3,0.4,0.5,0.6], [0.1,0.1,0.2,0.2], [0.7,0.7,0.8,0.8]", 
+         "[0.3, 0.4, 0.5, 0.6]"),
     ]
     
+    print("\n" + "-" * 80)
+    print("TEST RESULTS:")
+    print("-" * 80)
+    
     for name, pred, gt in test_cases:
-        result = compute_reward_soft(pred, gt, return_details=True)
+        result = analyze_reward(pred, gt)
         print(f"\n{name}:")
-        print(f"  Reward:       {result['reward']:.3f}")
-        if result['raw_ious']:
-            print(f"  Raw IoUs:     {[f'{x:.3f}' for x in result['raw_ious']]}")
-            print(f"  Quality:      {[f'{x:.3f}' for x in result['quality_scores']]}")
-            print(f"  Mean Quality: {result['mean_quality']:.3f}")
-        print(f"  F-beta:       {result['fbeta']:.3f}")
-        print(f"  Precision:    {result['precision']:.3f}")
-        print(f"  Recall:       {result['recall']:.3f}")
+        print(f"  Score: {result['score']:.3f}")
+        print(f"  Case: {result['case']}")
+        if result['avg_iou'] > 0:
+            print(f"  Avg IoU: {result['avg_iou']:.3f}")
+            print(f"  P/R: {result['precision']:.2f}/{result['recall']:.2f}")
+        if result.get('recall_bonus'):
+            print(f"  Recall bonus applied!")
     
-    # Comparison
+    # Mathematical explanation
     print("\n" + "=" * 80)
-    print("COMPARISON: Hard Threshold vs Soft Partial Credit")
-    print("=" * 80)
-    
-    print("\nScenario: Single box with varying IoU")
-    print(f"{'IoU':<8} {'Hard (old)':<15} {'Soft (new)':<15} {'Improvement'}")
-    print("-" * 60)
-    
-    for iou_val in [0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
-        # Simulate box with this IoU
-        gt = [[0.0, 0.0, 1.0, 1.0]]
-        
-        # Create pred box that gives desired IoU (approximately)
-        # For simplicity, just use the quality function
-        quality = iou_to_quality(iou_val)
-        
-        # Hard threshold (old):
-        hard_reward = iou_val if iou_val >= 0.5 else 0.0
-        
-        # Soft (new):
-        soft_reward = quality
-        
-        improvement = soft_reward - hard_reward
-        print(f"{iou_val:<8.2f} {hard_reward:<15.3f} {soft_reward:<15.3f} {improvement:+.3f}")
-    
-    print("\n" + "=" * 80)
-    print("KEY BENEFITS:")
+    print("MATHEMATICAL FORMULATION FOR THESIS:")
     print("=" * 80)
     print("""
-1. SMOOTH LEARNING SIGNAL
-   - IoU=0.45 → quality=0.39 (not 0!)
-   - Model gets feedback for "almost there" attempts
-   - No cliff at threshold
+1. F-β Score:
+   F_β = (1 + β²) × P × R / (β² × P + R)
+   
+   Where P = Σ(IoU_reward) / M  (weighted precision)
+         R = Σ(IoU_reward) / N  (weighted recall)
 
-2. ENCOURAGES IMPROVEMENT
-   - IoU 0.3→0.4 → quality 0.11→0.33 (large gain!)
-   - IoU 0.8→0.9 → quality 0.80→0.90 (small gain)
-   - Natural curriculum: steeper gradient where it matters
+2. IoU Reward (piecewise linear):
+   reward(IoU) = {
+       0                             if IoU < 0.15
+       0.5 × (IoU-0.15)/(τ-0.15)    if 0.15 ≤ IoU < τ
+       0.5 + 0.5 × (IoU-τ)/(1-τ)    if IoU ≥ τ
+   }
+   Where τ = IOU_THRESHOLD
 
-3. STILL BOUNDED [0,1]
-   - Stable for RL
-   - No negative rewards
-   - Clear optimization target
+3. Penalty Function:
+   penalty(k) = exp(-α × k)
+   Where α = PENALTY_STRENGTH, k = number of errors
 
-4. STILL SIMPLE
-   - Only 3 hyperparameters
-   - Easy to understand and debug
-   - Fast to compute
-
-RECOMMENDATION:
-This is the best reward for GRPO training with VLMs!
-Gives partial credit while still encouraging good boxes.
+4. Final Score:
+   - No findings: score = NO_FINDINGS_REWARD × penalty(M) × 0.5
+   - Detection: score = F_β × overpred_penalty + recall_bonus
+   
+5. Parameters (only 5!):
+   β ∈ [0.5, 2.0]: precision-recall trade-off
+   τ ∈ [0.3, 0.7]: IoU threshold
+   α ∈ [0.3, 1.0]: penalty strength
+   r_nf ∈ [0.2, 0.5]: no-findings reward
+   r_b ∈ [0, 0.2]: recall bonus
 """)
     
+    print("\n" + "=" * 80)
+    print("THESIS EXPLANATION:")
     print("=" * 80)
-    print("Ready for smooth GRPO training! 🎯")
-    print("=" * 80)
+    print("""
+"R7 uses just 5 hyperparameters to create a strict reward function
+suitable for medical grounding tasks:
+
+1. β controls the precision-recall trade-off in the F-beta score
+2. τ sets the IoU threshold for acceptable detections  
+3. α determines how harshly errors are penalized
+4. r_nf prevents exploitation of no-findings predictions
+5. r_b optionally rewards complete detection
+
+The key insight is using β=0.5 to emphasize precision over recall,
+critical for medical applications where false positives are costly."
+""")
