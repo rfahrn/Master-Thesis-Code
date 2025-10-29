@@ -21,12 +21,12 @@ from collections import defaultdict
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Reward Functions'))
 
 # Import all reward function modules
-import R1  # AP@0.5
-import R2  # Continuous IoU
-import R3  # F-beta × mean_IoU
-import R4  # Enhanced smooth gradients
-import R5  # Soft reward with partial credit
-import R6  # F1-weighted IoU
+from Reward_Functions import R1  # AP@0.5
+from Reward_Functions import R2  # Continuous IoU
+from Reward_Functions import R3  # F-beta × mean_IoU
+from Reward_Functions import R4  # Enhanced smooth gradients
+from Reward_Functions import R5  # Soft reward with partial credit
+from Reward_Functions import R2_2 # F1-weighted IoU
 
 # Set plotting style
 sns.set_style("whitegrid")
@@ -62,7 +62,7 @@ class RewardFunctionEvaluator:
             'R3_FBeta_MeanIoU': R3,
             'R4_Smooth_Gradients': R4,
             'R5_Soft_Partial_Credit': R5,
-            'R6_F1_Weighted_IoU': R6
+            'R6_F1_Weighted_IoU': R2_2
         }
         self.test_cases = self._create_test_cases()
         self.results = {}

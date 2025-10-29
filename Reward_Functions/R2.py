@@ -1,5 +1,5 @@
 """
-R2.py - Continuous Reward Version
+R3.py - Continuous Reward Version
 ================
 Smooth, continuous grounding reward function for RL training.
 

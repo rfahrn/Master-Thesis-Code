@@ -1,30 +1,6 @@
 """
 R2.py - F1-Weighted IoU Reward
-================================
-Smooth, bounded reward function for multi-box grounding with proper 
-precision-recall balance and localization quality weighting.
 
-IMPROVEMENTS OVER PENALTY-BASED APPROACHES:
-✅ Proper precision-recall balance via F1-score
-✅ Bounded rewards [0, 1] (stable for RL training)
-✅ Scales correctly with dataset characteristics
-✅ Natural localization quality penalty (via IoU weighting)
-✅ Smooth gradients for better learning
-✅ Handles multi-box scenarios correctly
-
-FORMULA:
-reward = F1-score × mean_IoU
-
-Where:
-- F1 = 2 × (Precision × Recall) / (Precision + Recall)
-- Precision = num_matches / num_predictions
-- Recall = num_matches / num_ground_truths
-- mean_IoU = average IoU of all matched boxes
-
-KEY INSIGHT:
-- F1 captures detection quality (balance of precision/recall)
-- mean_IoU captures localization quality
-- Their product gives a single, interpretable reward in [0, 1]
 """
 import re
 from typing import List, Dict, Any, Tuple
